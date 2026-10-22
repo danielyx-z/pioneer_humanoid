@@ -13,6 +13,9 @@
 > (+-180) are generous placeholders. `joint_proof.md` below is the original proof, with the original knee and elbow
 > ranges. Motor test of the corrected model: `src/simulation/pioneer_humanoid_model/` (61 of 61 motors pass).
 >
+> **Joint limits, torque and speed per joint**: [`src/simulation/pioneer_humanoid_model/JOINT_LIMITS.md`](../../src/simulation/pioneer_humanoid_model/JOINT_LIMITS.md)
+> (from `joint_specs.yaml` there: real for the legs, assumed for the arms, placeholders for the rest).
+>
 > **Cloning**: the meshes are in Git LFS: `git lfs install` before cloning, or `git lfs pull` after.
 
 

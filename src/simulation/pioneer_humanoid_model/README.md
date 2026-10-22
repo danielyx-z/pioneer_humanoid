@@ -31,10 +31,12 @@ Open **http://localhost:8080** (on a remote machine: `ssh -N -L 8080:localhost:8
   its torque limit.
 - **Sweep this motor / every motor in turn:** jumps the target to each limit and back.
 
-## Per-joint specs (`joint_specs.yaml`)
+## Per-joint specs (`joint_specs.yaml`, table in `JOINT_LIMITS.md`)
 
 Every motor's **limits, torque cap, speed limit and rotor inertia**, and the **link masses**, live in one file,
 with each value labelled with its source. Edit it as real specs arrive; nothing else needs changing.
+**[`JOINT_LIMITS.md`](JOINT_LIMITS.md)** is the same as a readable table, with the mass each joint moves; after
+editing the YAML, regenerate it with `uv run python motor_test.py --limits JOINT_LIMITS.md`.
 
 | Joints | Source |
 |---|---|

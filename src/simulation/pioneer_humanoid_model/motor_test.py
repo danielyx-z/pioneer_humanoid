@@ -143,6 +143,34 @@ def test_motor(sim: Sim, i: int) -> dict:
   return res
 
 
+def write_limits(robot: Robot, path: Path) -> str:
+  """JOINT_LIMITS.md: every joint's limits, torque, speed and where they come from (from joint_specs.yaml)."""
+  specs = robot.specs["joints"]
+  lines = [
+    "# Pioneer humanoid: joint limits",
+    "",
+    "Generated from `joint_specs.yaml` by `uv run python motor_test.py --limits JOINT_LIMITS.md`: edit the YAML, "
+    "not this table. *Mass moved* is everything outboard of the joint, with the model's current masses.",
+    "",
+    "| Group | Joint | Lower (°) | Upper (°) | Torque cap (Nm) | Speed limit (rad/s) | Rotor inertia (kg·m²) | Mass moved (kg) | Specs source | Limits source |",
+    "|---|---|---|---|---|---|---|---|---|---|",
+  ]
+  for j in robot.motors:
+    s = specs[j]
+    lines.append(f"| {robot.group_of(j)} | `{j}` | {s['lower']:g} | {s['upper']:g} | {s['torque']:g} | {s['speed']:g} | "
+                 f"{s['armature']:g} | {moved_mass(robot, j):.2f} | {s['source']} | {s['limits_source']} |")  # fmt: skip
+  if robot.mimics:
+    lines += ["", "**Finger DIP joints** (no motor; each follows its PIP joint, URDF `<mimic>`): "
+              + ", ".join(f"`{f}` = {mult:g} × `{lead}`" for f, (lead, mult) in sorted(robot.mimics.items())) + "."]  # fmt: skip
+  masses = robot.specs.get("links", {})
+  if masses:
+    lines += ["", "**Link masses set in `joint_specs.yaml`** (the rest are the URDF's placeholders): "
+              + ", ".join(f"`{k}` {v['mass']:g} kg" for k, v in masses.items()) + "."]  # fmt: skip
+  lines += ["", f"Total robot mass: {robot.model.body_subtreemass[0]:.1f} kg."]
+  path.write_text("\n".join(lines) + "\n")
+  return f"{len(robot.motors)} joints"
+
+
 def write_report(results: list[dict], base: str, path: Path) -> str:
   ok = [r for r in results if r["passed"]]
   lines = [
@@ -282,8 +310,12 @@ def main():
   ap.add_argument("--port", type=int, default=8080)
   ap.add_argument("--sweep", action="store_true", help="test every motor headless instead of opening the app")
   ap.add_argument("--report", default="motor_report.md", help="where --sweep writes its report")
+  ap.add_argument("--limits", metavar="FILE", help="write the joint limits table (e.g. JOINT_LIMITS.md) and exit")
   args = ap.parse_args()
   robot = build_model(args.base)
+  if args.limits:
+    print(write_limits(robot, Path(args.limits)), "->", args.limits)
+    return
   if args.sweep:
     sim = Sim(robot)
     results = []
