@@ -5,15 +5,16 @@ what the URDF can't say:
 
   * a base: "hang" holds the pelvis fixed HANG_HEIGHT above the floor (every limb moves
     freely, nothing touches the floor); "stand" gives the pelvis a free joint on the floor
-  * one position motor per joint (`motor_<joint>`), PD on the angle, its torque capped at
-    the joint's URDF effort limit
+  * per-joint specs from `joint_specs.yaml`: joint limits, motor torque cap, max speed and
+    rotor inertia (armature), and real link masses where known (legs, from the team model);
+    every value there is labelled real / assumed / placeholder
+  * one torque motor per joint (`motor_<joint>`), capped at the joint's spec; control.py
+    drives it with a PD (stiff enough to reach full torque at FULL_TORQUE_ERR of error) and a
+    speed- and acceleration-limited reference, so it never overshoots
   * the 8 finger DIP joints that mimic their PIP (URDF <mimic>), as equality constraints:
     they follow, they have no motor
   * a floor and lights; the robot's collision boxes touch the floor only (they are each
     link's bounding box, which overlap their neighbours, so self-collision is off)
-
-The URDF's masses, inertias and effort / velocity limits are placeholders (see the asset's
-README), so motor behaviour under load is indicative only.
 """
 
 from __future__ import annotations
@@ -26,13 +27,14 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
+import yaml
 
 REPO = Path(__file__).resolve().parents[3]
 ASSET = REPO / "assets" / "pioneer_humanoid"
 URDF = ASSET / "pioneer_humanoid_mujoco.urdf"
 HANG_HEIGHT = 0.35  # m the pelvis is lifted in "hang" mode, so the feet clear the floor
-KP_PER_NM = 20.0  # position gain [Nm/rad] per Nm of effort limit: a 10 Nm motor gets kp 200
-DAMP_RATIO = 1.0
+SPECS = Path(__file__).resolve().parent / "joint_specs.yaml"
+FULL_TORQUE_ERR = math.radians(5.0)  # a motor reaches its torque cap at this much error
 
 # joint groups for the GUI and the report, in display order
 GROUPS = {
@@ -52,6 +54,11 @@ class Robot:
   motors: list[str]  # joint names with a motor, in actuator order
   mimics: dict[str, tuple[str, float]]  # follower joint -> (leader joint, multiplier)
   base: str
+  specs: dict  # joint_specs.yaml, as loaded
+  speed: np.ndarray  # per motor: max joint speed [rad/s]
+  kp: np.ndarray  # per motor: position gain [Nm/rad]
+  lower: np.ndarray  # per motor: joint limits [rad]
+  upper: np.ndarray
 
   def group_of(self, joint: str) -> str:
     for g, pat in GROUPS.items():
@@ -95,7 +102,7 @@ def build_model(base: str = "hang") -> Robot:
     raise ValueError(f"base must be 'hang' or 'stand', not {base!r}")
   spec = mujoco.MjSpec.from_string(_urdf_text(base))
   spec.meshdir = str(ASSET)
-  spec.option.timestep = 0.002
+  spec.option.timestep = 0.001  # 1 ms: lets the motors be ~4x stiffer than at 2 ms and stay stable (control.py)
   spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
   spec.visual.global_.offwidth, spec.visual.global_.offheight = 1280, 960
 
@@ -106,27 +113,44 @@ def build_model(base: str = "hang") -> Robot:
   spec.worldbody.add_light(pos=[1.5, -1.5, 3], dir=[-0.5, 0.5, -1], diffuse=[0.7, 0.7, 0.7])
   spec.worldbody.add_light(pos=[-1.5, 1.5, 3], dir=[0.5, -0.5, -1], diffuse=[0.4, 0.4, 0.4])
 
+  specs = yaml.safe_load(SPECS.read_text())
+  for b in spec.bodies:  # real link masses where known; inertia scaled with the mass
+    s = specs.get("links", {}).get(b.name)
+    if s and b.mass > 0:
+      ratio = float(s["mass"]) / b.mass
+      b.mass, b.inertia = float(s["mass"]), [x * ratio for x in b.inertia]
+
   mimics = _mimics()
-  urdf_effort = {j.get("name"): float(j.find("limit").get("effort"))
-                 for j in ET.parse(URDF).getroot().findall("joint") if j.find("limit") is not None}  # fmt: skip
-  motors = []
+  motors, speed, kp, lower, upper = [], [], [], [], []
   for j in spec.joints:
     if j.type != mujoco.mjtJoint.mjJNT_HINGE:
       continue
-    j.armature = 0.01  # rotor inertia: keeps the light finger links stable
-    j.damping = [0.05, 0.0, 0.0]  # linear viscous term (the other two are nonlinear coefficients)
+    j.damping = [0.05, 0.0, 0.0]  # a little joint friction (the other two are nonlinear coefficients)
     if j.name in mimics:
       leader, mult = mimics[j.name]
+      j.armature = 0.01
       spec.add_equality(type=mujoco.mjtEq.mjEQ_JOINT, name1=j.name, name2=leader, data=[0, mult, 0, 0, 0, 0, 0, 0, 0, 0, 0])
       continue
-    effort = urdf_effort.get(j.name, 10.0)
+    s = specs["joints"][j.name]
+    j.range = [math.radians(s["lower"]), math.radians(s["upper"])]
+    j.armature = float(s["armature"])
+    torque = float(s["torque"])
+    j.limited = True
+    # the URDF importer turns each joint's effort="10" placeholder into a joint-level force clamp
+    # (actfrcrange) that silently caps every motor at 10 Nm: use the spec's torque there too
+    j.actfrclimited, j.actfrcrange = True, [-torque, torque]
     a = spec.add_actuator(name=f"motor_{j.name}", target=j.name, trntype=mujoco.mjtTrn.mjTRN_JOINT)
-    a.set_to_position(kp=KP_PER_NM * effort, dampratio=DAMP_RATIO)
-    a.forcelimited, a.forcerange = True, [-effort, effort]
-    a.ctrllimited, a.ctrlrange = True, list(j.range)
+    a.set_to_motor()  # torque in, torque out: control.py computes it
+    a.forcelimited, a.forcerange = True, [-torque, torque]
+    a.ctrllimited, a.ctrlrange = True, [-torque, torque]
     motors.append(j.name)
+    speed.append(float(s["speed"]))
+    kp.append(torque / FULL_TORQUE_ERR)
+    lower.append(j.range[0])
+    upper.append(j.range[1])
   model = spec.compile()
-  return Robot(model=model, motors=motors, mimics=mimics, base=base)
+  return Robot(model=model, motors=motors, mimics=mimics, base=base, specs=specs, speed=np.array(speed),
+               kp=np.array(kp), lower=np.array(lower), upper=np.array(upper))  # fmt: skip
 
 
 def visual_meshes(robot: Robot, cell: float = 0.003):

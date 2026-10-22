@@ -1,7 +1,7 @@
 """Move each simulated motor of the Pioneer humanoid and see what it does.
 
-Browser app (viser): one slider per motor, grouped by body part. Each motor is a
-position-controlled joint in MuJoCo physics; the panel shows its target, its actual
+Browser app (viser): one slider per motor, grouped by body part. Each motor is driven
+by control.py (no overshoot, its speed and torque limits from joint_specs.yaml) in MuJoCo physics; the panel shows its target, its actual
 angle and its torque, and flags a motor that can't reach its target or sits at its
 torque limit. Buttons sweep one motor, or every motor in turn, across its range.
 
@@ -27,11 +27,25 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from control import Controller
 from model import GROUPS, Robot, build_model, visual_meshes
 
-SWEEP_S = 3.0  # one motor's sweep: zero -> min -> max -> zero, in seconds
+SWEEP_S = 4.0  # one motor's sweep target: zero -> min -> max -> zero, in seconds (the motor follows at its speed limit)
+STEP_HOLD_S = 3.0  # how long a step test runs
 REACH_TOL = math.radians(3.0)  # a motor "reaches" a target within this
+OVERSHOOT_OK = math.radians(0.5)  # pass if it never goes past its target by more than this
 SAT_SHARE = 0.98  # "at its torque limit" from this share of the cap
+
+
+def source_tag(robot: Robot, joint: str) -> str:
+  src = robot.specs["joints"][joint]["source"]
+  return "real" if "real" in src else "assumed" if "ASSUMED" in src else "placeholder"
+
+
+def moved_mass(robot: Robot, joint: str) -> float:
+  """Mass the motor moves: everything outboard of its joint [kg]."""
+  m = robot.model
+  return float(m.body_subtreemass[m.jnt_bodyid[m.joint(joint).id]])
 
 
 # --------------------------------------------------------------------------- #
@@ -47,6 +61,7 @@ class Sim:
 
   def __post_init__(self):
     self.data = mujoco.MjData(self.robot.model)
+    self.ctl = Controller(self.robot, self.data)
     self.reset()
 
   @property
@@ -56,87 +71,106 @@ class Sim:
   def reset(self):
     with self.lock:
       mujoco.mj_resetData(self.m, self.data)
-      self.data.ctrl[:] = np.clip(0.0, self.m.actuator_ctrlrange[:, 0], self.m.actuator_ctrlrange[:, 1])
       mujoco.mj_forward(self.m, self.data)
+      self.ctl.reset()
 
   def step(self, seconds: float):
     with self.lock:
-      for _ in range(max(1, int(seconds / self.m.opt.timestep))):
+      for _ in range(max(1, int(round(seconds / self.m.opt.timestep)))):
+        self.ctl.tick()
         mujoco.mj_step(self.m, self.data)
 
   def status(self, i: int) -> dict:
-    """Motor i: target, actual angle, torque, and whether it is stuck or saturated."""
+    """Motor i: requested target, ramped reference, actual angle and speed, torque, flags."""
     j = self.robot.motors[i]
     q = float(self.data.qpos[self.robot.qadr(j)])
     tau = float(self.data.actuator_force[i])
     cap = float(self.m.actuator_forcerange[i, 1])
-    target = float(self.data.ctrl[i])
-    return dict(joint=j, target=target, q=q, err=target - q, tau=tau, cap=cap, sat=abs(tau) >= SAT_SHARE * cap)
+    target, ref = float(self.ctl.target[i]), float(self.ctl.ref[i])
+    arrived = abs(ref - target) < 1e-9  # the ramp has finished
+    return dict(joint=j, target=target, ref=ref, q=q, err=target - q, qd=float(self.data.qvel[self.robot.dofadr(j)]),
+                tau=tau, cap=cap, sat=abs(tau) >= SAT_SHARE * cap, stuck=arrived and abs(target - q) > REACH_TOL)  # fmt: skip
 
 
 def sweep_profile(lo: float, hi: float, t: float) -> float:
-  """Target at time t of a sweep: zero (clamped into range) -> lo -> hi -> zero."""
+  """Requested target at time t of a sweep: it jumps, like fast slider drags, from zero
+  (clamped into range) to the lower limit, then the upper limit, then back to zero."""
   z = min(max(0.0, lo), hi)
-  pts = [(0.0, z), (0.2, lo), (0.65, hi), (1.0, z)]
-  s = min(max(t / SWEEP_S, 0.0), 1.0)
-  for (s0, v0), (s1, v1) in zip(pts, pts[1:]):
-    if s <= s1:
-      w = (s - s0) / (s1 - s0)
-      w = w * w * (3 - 2 * w)  # smooth
-      return v0 + (v1 - v0) * w
-  return z
+  s = t / SWEEP_S
+  return z if s < 0.05 else lo if s < 0.4 else hi if s < 0.8 else z
 
 
 def test_motor(sim: Sim, i: int) -> dict:
-  """Sweep motor i alone (others held at zero) and measure how well it follows."""
+  """Motor i alone (the others hold zero): a sweep across its range, then a step to half of
+  each side of its range. Measures reach, overshoot, speed against its limit and torque."""
+  m, j = sim.m, sim.robot.motors[i]
+  lo, hi = sim.robot.lower[i], sim.robot.upper[i]
+  z = min(max(0.0, lo), hi)
+  res = dict(joint=j, group=sim.robot.group_of(j), lo=lo, hi=hi, cap=float(m.actuator_forcerange[i, 1]),
+             speed_limit=float(sim.robot.speed[i]), mass=moved_mass(sim.robot, j), source=source_tag(sim.robot, j),
+             reached_lo=False, reached_hi=False, overshoot=0.0, peak_speed=0.0, peak_tau=0.0, settle=0.0)  # fmt: skip
   sim.reset()
-  lo, hi = sim.m.actuator_ctrlrange[i]
-  worst_err, peak_tau, reached_lo, reached_hi, sat_steps, n = 0.0, 0.0, False, False, 0, 0
-  dt = 0.01
-  for k in range(int(SWEEP_S / dt) + int(0.5 / dt)):
-    sim.data.ctrl[i] = sweep_profile(lo, hi, k * dt)
+  dt, sat, n = 0.01, 0, 0
+  for k in range(int(SWEEP_S / dt) + int(1.0 / dt)):
+    sim.ctl.set_target(i, sweep_profile(lo, hi, k * dt))
     sim.step(dt)
     s = sim.status(i)
-    worst_err = max(worst_err, abs(s["err"]))
-    peak_tau = max(peak_tau, abs(s["tau"]))
-    reached_lo |= abs(s["q"] - lo) < REACH_TOL
-    reached_hi |= abs(s["q"] - hi) < REACH_TOL
-    sat_steps += s["sat"]
+    res["reached_lo"] |= abs(s["q"] - lo) < REACH_TOL
+    res["reached_hi"] |= abs(s["q"] - hi) < REACH_TOL
+    res["peak_speed"] = max(res["peak_speed"], abs(s["qd"]))
+    res["peak_tau"] = max(res["peak_tau"], abs(s["tau"]))
+    sat += s["sat"]
     n += 1
-  return dict(
-    joint=sim.robot.motors[i], group=sim.robot.group_of(sim.robot.motors[i]), lo=lo, hi=hi,
-    reached_lo=reached_lo, reached_hi=reached_hi, worst_err=worst_err, peak_tau=peak_tau,
-    cap=float(sim.m.actuator_forcerange[i, 1]), sat_share=sat_steps / n,
-  )  # fmt: skip
+  res["sat_share"] = sat / n
+  for end in (lo, hi):  # step tests
+    if abs(end - z) < 1e-6:
+      continue
+    goal = z + 0.5 * (end - z)
+    sign = 1.0 if goal > z else -1.0
+    sim.reset()
+    sim.ctl.set_target(i, goal)
+    last_out = 0.0
+    for k in range(int(STEP_HOLD_S / dt)):
+      sim.step(dt)
+      s = sim.status(i)
+      res["overshoot"] = max(res["overshoot"], sign * (s["q"] - goal))
+      res["peak_speed"] = max(res["peak_speed"], abs(s["qd"]))
+      if abs(s["q"] - goal) > math.radians(1.0):
+        last_out = (k + 1) * dt
+    res["settle"] = max(res["settle"], last_out)
+  res["passed"] = (res["reached_lo"] and res["reached_hi"] and res["overshoot"] <= OVERSHOOT_OK
+                   and res["sat_share"] < 0.05 and res["peak_speed"] <= 1.05 * res["speed_limit"])  # fmt: skip
+  return res
 
 
 def write_report(results: list[dict], base: str, path: Path) -> str:
-  ok = [r for r in results if r["reached_lo"] and r["reached_hi"] and r["sat_share"] < 0.05]
+  ok = [r for r in results if r["passed"]]
   lines = [
     "# Pioneer humanoid: motor test",
     "",
-    f"Each motor alone, in MuJoCo physics, base `{base}`: commanded from zero to its lower limit, to its upper limit "
-    f"and back over {SWEEP_S:.0f} s, all other motors held at zero. A motor **passes** when it reaches both limits "
-    f"(within {math.degrees(REACH_TOL):.0f} deg) and spends under 5% of the sweep at its torque cap.",
+    f"Each motor alone, in MuJoCo physics, base `{base}`, all other motors holding zero:",
+    f"- **sweep**: its target jumps zero → lower limit → upper limit → zero over {SWEEP_S:.0f} s (like fast slider drags);",
+    f"- **step**: its target jumps from zero to half of each side of its range, held {STEP_HOLD_S:.0f} s.",
     "",
-    "Masses, inertias and torque caps are the URDF's placeholders (see `assets/pioneer_humanoid/README.md`), so a "
-    "failure means *with these values*: check it again once the real motor specs are in.",
+    f"A motor **passes** when it reaches both limits (within {math.degrees(REACH_TOL):.0f}°), never goes past a target "
+    f"by more than {math.degrees(OVERSHOOT_OK):.1f}°, stays within its speed limit (+5%), and spends under 5% of the "
+    "sweep at its torque cap. Limits, torque caps, speed limits and the leg masses come from `joint_specs.yaml`; "
+    "*Source* says whether a joint's motor values are real, assumed or placeholders.",
     "",
     f"**{len(ok)} of {len(results)} motors pass.**",
     "",
-    "| Group | Motor | Range (deg) | Reaches min | Reaches max | Worst tracking error (deg) | Peak torque / cap (Nm) | Time at cap | Result |",
-    "|---|---|---|---|---|---|---|---|---|",
+    "| Group | Motor | Range (°) | Torque cap (Nm) | Speed limit (rad/s) | Mass moved (kg) | Reaches min / max | "
+    "Overshoot (°) | Peak speed (rad/s) | Settles in (s) | Peak torque (Nm) | Time at cap | Source | Result |",
+    "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
   ]
   for r in results:
-    passed = r in ok
     lines.append(
-      f"| {r['group']} | `{r['joint']}` | {math.degrees(r['lo']):.0f} .. {math.degrees(r['hi']):.0f} | "
-      f"{'yes' if r['reached_lo'] else '**no**'} | {'yes' if r['reached_hi'] else '**no**'} | "
-      f"{math.degrees(r['worst_err']):.1f} | {r['peak_tau']:.2f} / {r['cap']:.0f} | {100 * r['sat_share']:.0f}% | "
-      f"{'PASS' if passed else '**FAIL**'} |"
+      f"| {r['group']} | `{r['joint']}` | {math.degrees(r['lo']):.0f} .. {math.degrees(r['hi']):.0f} | {r['cap']:g} | "
+      f"{r['speed_limit']:g} | {r['mass']:.2f} | {'yes' if r['reached_lo'] else '**no**'} / {'yes' if r['reached_hi'] else '**no**'} | "
+      f"{math.degrees(r['overshoot']):.2f} | {r['peak_speed']:.2f} | {r['settle']:.2f} | {r['peak_tau']:.1f} | "
+      f"{100 * r['sat_share']:.0f}% | {r['source']} | {'PASS' if r['passed'] else '**FAIL**'} |"
     )
-  text = "\n".join(lines) + "\n"
-  path.write_text(text)
+  path.write_text("\n".join(lines) + "\n")
   return f"{len(ok)} of {len(results)} motors pass"
 
 
@@ -176,7 +210,7 @@ def run_app(robot: Robot, port: int):
       continue
     with server.gui.add_folder(g, expand_by_default=g in ("Torso & head", "Left arm", "Left leg")):
       for i in by_group[g]:
-        lo, hi = np.degrees(m.actuator_ctrlrange[i])
+        lo, hi = np.degrees(robot.lower[i]), np.degrees(robot.upper[i])
         init = float(np.clip(0.0, lo, hi))
         s = server.gui.add_slider(robot.motors[i], min=float(lo), max=float(hi), step=0.5, initial_value=init)
         while len(sliders) <= i:
@@ -188,14 +222,14 @@ def run_app(robot: Robot, port: int):
         @s.on_update
         def _(_, i=i, s=s):
           if state["sweep"] is None:
-            sim.data.ctrl[i] = math.radians(s.value)
+            sim.ctl.set_target(i, math.radians(s.value))
 
   def zero_all():
     state["sweep"] = None
     for i, s in enumerate(sliders):
-      lo, hi = m.actuator_ctrlrange[i]
+      lo, hi = robot.lower[i], robot.upper[i]
       s.value = math.degrees(float(np.clip(0.0, lo, hi)))
-      sim.data.ctrl[i] = math.radians(s.value)
+      sim.ctl.set_target(i, math.radians(s.value))
 
   b_zero.on_click(lambda _: zero_all())
   b_stop.on_click(lambda _: state.update(sweep=None))
@@ -210,10 +244,10 @@ def run_app(robot: Robot, port: int):
     if sw is not None:  # drive the current motor of the sweep
       queue, start = sw
       i = queue[0]
-      lo, hi = m.actuator_ctrlrange[i]
+      lo, hi = robot.lower[i], robot.upper[i]
       t = time.time() - start
-      sim.data.ctrl[i] = sweep_profile(lo, hi, t)
-      sliders[i].value = round(math.degrees(sim.data.ctrl[i]) * 2) / 2
+      sim.ctl.set_target(i, sweep_profile(lo, hi, t))
+      sliders[i].value = round(math.degrees(sim.ctl.target[i]) * 2) / 2
       if t > SWEEP_S:
         queue.pop(0)
         state["sweep"] = (queue, time.time()) if queue else None
@@ -227,10 +261,13 @@ def run_app(robot: Robot, port: int):
       flagged = []
       for i in range(len(robot.motors)):
         s = sim.status(i)
-        stuck = abs(s["err"]) > REACH_TOL
-        mark = " ⚠️ can't reach" if stuck else ""
+        mark = " ⚠️ can't reach" if s["stuck"] else ""
         mark += " 🔴 at torque cap" if s["sat"] else ""
-        readouts[i].content = f"actual **{math.degrees(s['q']):+.1f}°**, torque {s['tau']:+.2f} / {s['cap']:.0f} Nm{mark}"
+        readouts[i].content = (
+          f"actual **{math.degrees(s['q']):+.1f}°** · {s['qd']:+.1f} / {robot.speed[i]:g} rad/s · "
+          f"torque {s['tau']:+.1f} / {s['cap']:g} Nm{mark}  \n"
+          f"<small>moves {moved_mass(robot, s['joint']):.2f} kg · specs: {source_tag(robot, s['joint'])}</small>"
+        )
         if mark:
           flagged.append(f"`{s['joint']}`{mark}")
       sweeping = f"Sweeping **{robot.motors[state['sweep'][0][0]]}**. " if state["sweep"] else ""
@@ -253,8 +290,9 @@ def main():
     for i, j in enumerate(robot.motors):
       r = test_motor(sim, i)
       results.append(r)
-      flag = "" if r["reached_lo"] and r["reached_hi"] and r["sat_share"] < 0.05 else "  <-- FAIL"
-      print(f"{j:18s} reached min {r['reached_lo']!s:5s} max {r['reached_hi']!s:5s} worst err {math.degrees(r['worst_err']):5.1f} deg  peak torque {r['peak_tau']:5.2f}/{r['cap']:.0f} Nm{flag}", flush=True)
+      print(f"{j:17s} reach {r['reached_lo']!s:5s}/{r['reached_hi']!s:5s} overshoot {math.degrees(r['overshoot']):5.2f} deg  "
+            f"peak speed {r['peak_speed']:5.2f}/{r['speed_limit']:g}  torque {r['peak_tau']:6.1f}/{r['cap']:g}  "
+            f"at cap {100 * r['sat_share']:.0f}%  {'PASS' if r['passed'] else 'FAIL'}", flush=True)
     print(write_report(results, args.base, Path(args.report)), "->", args.report)
   else:
     run_app(robot, args.port)
